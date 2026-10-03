@@ -152,7 +152,7 @@ def key_pair(binary, private=None):
 def client_link(item, client, host, public):
     reality = item['streamSettings']['realitySettings']
     query = {'encryption': 'none', 'security': 'reality',
-             'sni': reality['serverNames'][0], 'fp': 'chrome', 'pbk': public,
+             'sni': reality['serverNames'][0], 'fp': 'firefox', 'pbk': public,
              'sid': reality['shortIds'][0], 'type': 'tcp'}
     if client.get('flow'):
         query['flow'] = client['flow']
@@ -533,7 +533,7 @@ def adopt(args):
 
 def parser():
     p = argparse.ArgumentParser(description='VLESS + REALITY: установка и управление устройствами.')
-    p.add_argument('--version', action='version', version='vless-manager 1.1.0')
+    p.add_argument('--version', action='version', version='vless-manager 1.1.1')
     sub = p.add_subparsers(dest='command', required=True)
     s = sub.add_parser('setup', help='Настроить новый VPS (Ubuntu/Debian + systemd)')
     s.add_argument('--host', required=True, type=hostname, help='Публичный IPv4 или DNS сервера')

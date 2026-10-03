@@ -73,6 +73,7 @@ class ManagerTests(unittest.TestCase):
             parsed = urlsplit(link)
             self.assertEqual(parsed.hostname, self.meta['host'])
             self.assertEqual(parse_qs(parsed.query)['flow'], [m.FLOW])
+            self.assertEqual(parse_qs(parsed.query)['fp'], ['firefox'])
             self.assertEqual(parse_qs(parsed.query)['pbk'], ['p' * 43])
             self.assertEqual(self.call(['link', 'iphone']), link)
             changed = m.read_json(self.path)

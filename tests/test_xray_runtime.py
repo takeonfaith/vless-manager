@@ -61,7 +61,7 @@ class RealXrayTest(unittest.TestCase):
                  'users': [{'id': identity, 'encryption': 'none', 'flow': m.FLOW}]}]},
                 'streamSettings': {'network': 'tcp', 'security': 'reality',
                                    'realitySettings': {'serverName': 'www.bing.com',
-                                                      'fingerprint': 'chrome', 'password': public,
+                                                      'fingerprint': 'firefox', 'password': public,
                                                       'shortId': item['streamSettings']['realitySettings']['shortIds'][0]}}}]}
         httpd = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
