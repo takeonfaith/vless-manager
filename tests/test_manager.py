@@ -3,11 +3,13 @@ import contextlib
 import copy
 import importlib.util
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import patch
 from urllib.parse import urlsplit, parse_qs
 
@@ -181,6 +183,38 @@ class ManagerTests(unittest.TestCase):
         self.call(['set-host', 'vpn.example.com'])
         self.assertEqual(m.read_json(self.meta_path)['host'], 'vpn.example.com')
         self.assertEqual(self.path.read_bytes(), before)
+
+    def test_download_checks_checksum_and_service_can_traverse_binary_directory(self):
+        blob = io.BytesIO()
+        with zipfile.ZipFile(blob, 'w') as z:
+            z.writestr('xray', b'test-binary')
+        archive = blob.getvalue()
+        digest = hashlib.sha256(archive).hexdigest()
+
+        def downloaded(args, **kwargs):
+            if args[0] == 'curl':
+                Path(args[-2]).write_bytes(('SHA2-256= ' + digest).encode()
+                                          if args[-1].endswith('.dgst') else archive)
+            return 'version'
+
+        binary = self.root / 'bin-dir' / 'xray'
+        previous = os.umask(0o077)
+        try:
+            with patch.object(m, 'BINARY', binary), patch.object(m, 'run', side_effect=downloaded), \
+                 patch.object(m.platform, 'machine', return_value='x86_64'):
+                m.download_xray('26.3.27')
+            self.assertEqual(binary.parent.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(binary.read_bytes(), b'test-binary')
+            binary.unlink()
+            digest = '0' * 64
+            with patch.object(m, 'BINARY', binary), patch.object(m, 'run', side_effect=downloaded), \
+                 patch.object(m.platform, 'machine', return_value='x86_64'):
+                with self.assertRaisesRegex(m.Error, 'SHA-256'):
+                    m.download_xray('26.3.27')
+            self.assertFalse(binary.exists())
+        finally:
+            os.umask(previous)
 
 
 if __name__ == '__main__':

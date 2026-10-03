@@ -262,6 +262,8 @@ def download_xray(version):
         with zipfile.ZipFile(archive) as z:
             data = z.read('xray')
         BINARY.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        # main() uses umask 077; the service user must be able to traverse this directory.
+        os.chmod(BINARY.parent, 0o755)
         atomic_write(BINARY, data, mode=0o755)
     run([BINARY, 'version'])
 
