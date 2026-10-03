@@ -1,0 +1,27 @@
+name: Tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s tests -v
+      - run: bash -n install.sh
+  install:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install manager
+        run: sudo bash install.sh
+      - name: Clean VPS setup and user lifecycle
+        run: sudo python3 tests/smoke_install.py
+      - name: Real VLESS connection and revocation (isolated loopback processes)
+        run: XRAY_TEST_BINARY=/usr/local/lib/vless-manager/xray python3 -m unittest discover -s tests -p test_xray_runtime.py -v
