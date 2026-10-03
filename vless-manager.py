@@ -286,9 +286,9 @@ def setup(args):
         if '=' in line:
             key, value = line.split('=', 1)
             os_info[key] = value.strip('"')
-    supported = {'ubuntu': {'22.04', '24.04'}, 'debian': {'12', '13'}}
+    supported = {'ubuntu': {'22.04', '24.04', '26.04'}, 'debian': {'12', '13'}}
     if os_info.get('VERSION_ID') not in supported.get(os_info.get('ID'), set()):
-        raise Error('Setup поддерживает Ubuntu 22.04/24.04 и Debian 12/13.')
+        raise Error('Setup поддерживает Ubuntu 22.04/24.04/26.04 и Debian 12/13.')
     if not Path('/run/systemd/system').is_dir():
         raise Error('Нужна машина с работающим systemd.')
     existing = [CONFIG, UNIT, BINARY, Path('/usr/local/etc/xray/config.json'), Path('/etc/xray/config.json')]
