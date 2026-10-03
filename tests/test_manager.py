@@ -23,7 +23,7 @@ class ManagerTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.config = m.new_config('test-private-key', 'www.example.com', 443)
+        self.config = m.configure_api(m.new_config('test-private-key', 'www.example.com', 443), None, 10085)
         self.config['inbounds'].insert(0, {'protocol': 'socks', 'port': 1080})
         self.item = self.config['inbounds'][1]
         self.item['settings']['clients'] = [
@@ -59,8 +59,16 @@ class ManagerTests(unittest.TestCase):
         self.assertIs(m.inbound(self.config, 'second'), self.config['inbounds'][-1])
 
     def test_add_link_remove_preserves_other_users_and_settings(self):
+        live = {'existing': self.item['settings']['clients'][0]['id']}
+        def change(meta, config, action, client):
+            if action == 'add':
+                live[client['email'].lower()] = client['id']
+            else:
+                live.pop(client['email'].lower())
         with patch.object(m, 'key_pair', return_value=('private', 'p' * 43)), \
-             patch.object(m, 'validate'), patch.object(m, 'run'), patch.object(m, 'healthy'):
+             patch.object(m, 'validate'), patch.object(m, 'run', side_effect=AssertionError('No restart allowed')), \
+             patch.object(m, 'api_users', side_effect=lambda *a: dict(live)), \
+             patch.object(m, 'api_change', side_effect=change):
             link = self.call(['add', 'iphone'])
             parsed = urlsplit(link)
             self.assertEqual(parsed.hostname, self.meta['host'])
@@ -82,10 +90,56 @@ class ManagerTests(unittest.TestCase):
     def test_duplicate_and_missing_names_do_not_write(self):
         before = self.path.read_bytes()
         with patch.object(m, 'key_pair', return_value=('private', 'p' * 43)):
-            for args in [['add', 'existing'], ['remove', 'missing', '--yes'], ['link', 'missing']]:
+            for args in [['add', 'existing'], ['add', 'EXISTING'], ['remove', 'missing', '--yes'], ['link', 'missing']]:
                 with self.assertRaises(m.Error):
                     self.call(args)
         self.assertEqual(self.path.read_bytes(), before)
+
+    def test_api_failure_restores_file_without_restart(self):
+        before = self.path.read_bytes()
+        candidate = copy.deepcopy(self.config)
+        client = {'email': 'new', 'id': 'test-id', 'flow': m.FLOW}
+        m.inbound(candidate)['settings']['clients'].append(client)
+        with patch.object(m, 'api_users', return_value={}), patch.object(m, 'validate'), \
+             patch.object(m, 'api_change', side_effect=m.Error('API failed')), \
+             patch.object(m, 'run', side_effect=AssertionError('No restart allowed')):
+            with self.assertRaisesRegex(m.Error, 'без перезапуска'):
+                m.apply_user(self.meta, candidate, 'add', client)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_timed_out_but_applied_rpc_is_success(self):
+        candidate = copy.deepcopy(self.config)
+        client = {'email': 'new', 'id': 'test-id', 'flow': m.FLOW}
+        m.inbound(candidate)['settings']['clients'].append(client)
+        with patch.object(m, 'api_users', side_effect=[{}, {'new': 'test-id'}, {'new': 'test-id'}]), \
+             patch.object(m, 'validate'), patch.object(m, 'api_change', side_effect=m.Error('timeout')):
+            m.apply_user(self.meta, candidate, 'add', client)
+        self.assertEqual(m.read_json(self.path), candidate)
+
+    def test_api_zero_success_is_not_accepted(self):
+        with patch.object(m, 'run', return_value='Added 0 user(s) in total.'):
+            with self.assertRaisesRegex(m.Error, 'не подтвердил'):
+                m.api_change(self.meta, self.config, 'add', {'id': 'test', 'email': 'new'})
+
+    def test_api_unavailable_does_not_modify_disk(self):
+        before = self.path.read_bytes()
+        with patch.object(m, 'api_users', side_effect=m.Error('unreachable')):
+            with self.assertRaises(m.Error):
+                m.apply_user(self.meta, self.config, 'add', {'id': 'test', 'email': 'new'})
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_api_access_guard_is_mandatory(self):
+        self.assertEqual(m.api_endpoint(self.config), '127.0.0.1:10085')
+        self.config['routing']['rules'] = []
+        with self.assertRaises(m.Error):
+            m.api_endpoint(self.config)
+        with self.assertRaises(m.Error):
+            m.configure_api(self.config, None, 10085)
+
+    def test_enable_api_is_idempotent_without_restart(self):
+        with patch.object(m, 'api_users', return_value={}), patch.object(m, 'apply_config') as apply:
+            self.call(['enable-api'])
+        apply.assert_not_called()
 
     def test_invalid_candidate_never_replaces_config(self):
         before = self.path.read_bytes()

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Small, dependency-free CLI for VLESS + REALITY on a systemd VPS."""
 import argparse
+import copy
 import fcntl
 import grp
 import hashlib
@@ -31,6 +32,8 @@ SERVICE = 'vless-manager-xray.service'
 UNIT = Path('/etc/systemd/system') / SERVICE
 XRAY_VERSION = '26.3.27'
 FLOW = 'xtls-rprx-vision'
+API_TAG = 'vless-manager-api'
+API_BLOCK = 'vless-manager-api-block'
 
 
 class Error(Exception):
@@ -171,6 +174,133 @@ def new_config(private, sni, listen_port):
         'outbounds': [{'protocol': 'freedom', 'tag': 'direct'}]}
 
 
+def configure_api(config, selected_tag, api_port):
+    candidate = copy.deepcopy(config)
+    if candidate.get('api'):
+        raise Error('В конфиге уже есть API. Автоматическая перезапись запрещена.')
+    tags = {i.get('tag') for i in candidate.get('inbounds', []) + candidate.get('outbounds', [])}
+    if tags.intersection({API_TAG, API_BLOCK}):
+        raise Error('Зарезервированный тег API уже используется.')
+    item = inbound(candidate, selected_tag)
+    if not item.get('tag'):
+        if 'vless-manager-in' in tags:
+            raise Error('Тег vless-manager-in уже используется.')
+        item['tag'] = 'vless-manager-in'
+    if any(i.get('port') == api_port for i in candidate.get('inbounds', [])):
+        raise Error('Порт API совпадает с портом inbound.')
+    candidate['api'] = {'tag': API_TAG, 'listen': f'127.0.0.1:{api_port}',
+                        'services': ['HandlerService']}
+    candidate.setdefault('outbounds', []).append({'protocol': 'blackhole', 'tag': API_BLOCK})
+    # VPN clients must not reach the unauthenticated management API via Freedom.
+    # Block the destination port for ALL proxied traffic, including DNS names
+    # resolving to loopback; direct local administrative calls bypass routing.
+    candidate.setdefault('routing', {}).setdefault('rules', []).insert(0, {
+        'type': 'field', 'network': 'tcp', 'port': str(api_port), 'outboundTag': API_BLOCK})
+    return candidate
+
+
+def api_endpoint(config):
+    api = config.get('api', {})
+    endpoint = api.get('listen', '')
+    if api.get('tag') != API_TAG or 'HandlerService' not in api.get('services', []):
+        raise Error('Сначала выполни vless-manager enable-api (один перезапуск VPN).')
+    if not re.fullmatch(r'127\.0\.0\.1:[0-9]+', endpoint):
+        raise Error('API менеджера должен слушать только 127.0.0.1.')
+    expected = {'type': 'field', 'network': 'tcp', 'port': endpoint.rsplit(':', 1)[1],
+                'outboundTag': API_BLOCK}
+    rules = config.get('routing', {}).get('rules', [])
+    if not rules or rules[0] != expected or not any(
+            o.get('tag') == API_BLOCK and o.get('protocol') == 'blackhole'
+            for o in config.get('outbounds', [])):
+        raise Error('Отсутствует правило защиты API от доступа через VPN.')
+    return endpoint
+
+
+def api_users(meta, config):
+    item = inbound(config, meta.get('tag'))
+    if not item.get('tag'):
+        raise Error('Для управления через API нужен тег inbound.')
+    output = run([meta['binary'], 'api', 'inbounduser', '--server=' + api_endpoint(config),
+                  '-tag=' + item['tag']], timeout=10)
+    try:
+        users = json.loads(output).get('users', [])
+        return {u['email'].lower(): u['account']['id'] for u in users}
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise Error('Не удалось проверить пользователей через API Xray.') from exc
+
+
+def api_change(meta, config, action, client):
+    item = inbound(config, meta.get('tag'))
+    endpoint = '--server=' + api_endpoint(config)
+    if action == 'remove':
+        output = run([meta['binary'], 'api', 'rmu', endpoint, '-tag=' + item['tag'],
+                      client['email']], timeout=10)
+        expected = 'Removed 1 user(s) in total.'
+    else:
+        # A complete inbound is needed by adu's config builder, but only ONE
+        # user must be submitted. Submitting all clients would cause duplicates.
+        single = copy.deepcopy(item)
+        single['settings']['clients'] = [client]
+        with tempfile.TemporaryDirectory(prefix='vless-api-') as directory:
+            path = Path(directory) / 'user.json'
+            path.write_bytes(encode({'inbounds': [single]}))
+            path.chmod(0o600)
+            output = run([meta['binary'], 'api', 'adu', endpoint, path], timeout=10)
+        expected = 'Added 1 user(s) in total.'
+    # Xray's CLI can exit 0 even when the RPC failed or it added zero users.
+    if expected not in output.splitlines():
+        raise Error('Xray API не подтвердил изменение пользователя.')
+
+
+def apply_user(meta, candidate, action, client):
+    path = Path(meta['config'])
+    if path.is_symlink():
+        raise Error('Конфигурация не должна быть символической ссылкой.')
+    original = path.read_bytes()
+    old = json.loads(original)
+    st = path.stat()
+    email = client['email'].lower()
+    before = api_users(meta, old)
+    expected_before = None if action == 'add' else client['id']
+    if before.get(email) != expected_before:
+        raise Error('Рабочие пользователи Xray расходятся с конфигом; изменение отменено.')
+    fd, tmp = tempfile.mkstemp(prefix='.validate-', suffix='.json', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(encode(candidate))
+        validate(meta['binary'], tmp)
+    finally:
+        os.unlink(tmp)
+    BACKUPS.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(BACKUPS, 0o700)
+    backup = BACKUPS / f'{time.time_ns()}-{secrets.token_hex(4)}.json'
+    atomic_write(backup, original)
+    attrs = {'mode': st.st_mode & 0o777, 'uid': st.st_uid, 'gid': st.st_gid}
+    try:
+        # Save first so an unrelated restart during the RPC loads the new state.
+        atomic_write(path, encode(candidate), **attrs)
+        wanted = client['id'] if action == 'add' else None
+        try:
+            api_change(meta, candidate, action, client)
+        except Error:
+            # A timed-out RPC may already have succeeded; verify before undoing.
+            if api_users(meta, candidate).get(email) != wanted:
+                raise
+        if api_users(meta, candidate).get(email) != wanted:
+            raise Error('API не применил изменение.')
+    except (Error, OSError, KeyboardInterrupt) as exc:
+        atomic_write(path, original, **attrs)
+        try:
+            if api_users(meta, old).get(email) != expected_before:
+                api_change(meta, old, 'remove' if action == 'add' else 'add', client)
+            if api_users(meta, old).get(email) != expected_before:
+                raise Error('Рабочее состояние не восстановлено.')
+        except Error:
+            raise Error(f'Файл восстановлен, но состояние API не подтверждено. '
+                        f'Xray НЕ перезапускался. Проверь службу; backup: {backup}') from exc
+        raise Error('Изменение отменено и восстановлено без перезапуска VPN.') from exc
+
+
 def validate(binary, path):
     run([binary, 'run', '-test', '-config', path])
 
@@ -182,7 +312,7 @@ def healthy(service):
         run(['systemctl', 'is-active', '--quiet', service])
 
 
-def apply_config(meta, candidate):
+def apply_config(meta, candidate, postcheck=None):
     path = Path(meta['config'])
     if path.is_symlink():
         raise Error('Конфигурация не должна быть символической ссылкой.')
@@ -204,6 +334,8 @@ def apply_config(meta, candidate):
         atomic_write(path, encode(candidate), **attrs)
         run(['systemctl', 'restart', meta['service']])
         healthy(meta['service'])
+        if postcheck:
+            postcheck()
     except (Error, OSError, KeyboardInterrupt) as exc:
         atomic_write(path, original, **attrs)
         try:
@@ -223,7 +355,7 @@ def current():
 
 
 def unique_client(item, device):
-    found = [c for c in item['settings']['clients'] if c.get('email') == device]
+    found = [c for c in item['settings']['clients'] if c.get('email', '').lower() == device.lower()]
     if len(found) != 1:
         raise Error('Устройство не найдено или его имя не уникально.')
     return found[0]
@@ -319,7 +451,7 @@ def setup(args):
         os.chown(STATE, 0, group)
         os.chmod(STATE, 0o750)
         private, _ = key_pair(BINARY)
-        config = new_config(private, args.sni, args.port)
+        config = configure_api(new_config(private, args.sni, args.port), None, args.api_port)
         atomic_write(CONFIG, encode(config), mode=0o640, gid=group)
         validate(BINARY, CONFIG)
         unit = f'''[Unit]
@@ -356,6 +488,7 @@ WantedBy=multi-user.target
         healthy(SERVICE)
         meta = {'config': str(CONFIG), 'binary': str(BINARY), 'service': SERVICE,
                 'host': args.host, 'tag': 'vless-reality'}
+        api_users(meta, config)
         atomic_write(META, encode(meta))
     except (Error, OSError, KeyboardInterrupt) as exc:
         if UNIT.exists():
@@ -400,12 +533,13 @@ def adopt(args):
 
 def parser():
     p = argparse.ArgumentParser(description='VLESS + REALITY: установка и управление устройствами.')
-    p.add_argument('--version', action='version', version='vless-manager 1.0.0')
+    p.add_argument('--version', action='version', version='vless-manager 1.1.0')
     sub = p.add_subparsers(dest='command', required=True)
     s = sub.add_parser('setup', help='Настроить новый VPS (Ubuntu/Debian + systemd)')
     s.add_argument('--host', required=True, type=hostname, help='Публичный IPv4 или DNS сервера')
     s.add_argument('--sni', default='www.bing.com', type=hostname)
     s.add_argument('--port', default=443, type=port)
+    s.add_argument('--api-port', default=10085, type=port, help='Локальный порт API (по умолчанию 10085)')
     s.add_argument('--xray-version', default=XRAY_VERSION)
     a = sub.add_parser('adopt', help='Подключить существующую конфигурацию без её изменения')
     a.add_argument('--host', required=True, type=hostname)
@@ -425,6 +559,8 @@ def parser():
     sub.add_parser('status', help='Состояние systemd-службы')
     sub.add_parser('logs', help='Последние 50 строк журнала Xray')
     sub.add_parser('restart', help='Проверить конфиг и перезапустить Xray')
+    api = sub.add_parser('enable-api', help='Включить управление без перезапуска (один перезапуск при переходе)')
+    api.add_argument('--port', default=10085, type=port, help='Локальный порт API')
     h = sub.add_parser('set-host', help='Изменить адрес в выдаваемых ссылках')
     h.add_argument('host', type=hostname)
     return p
@@ -436,7 +572,20 @@ def dispatch(args):
     if args.command == 'adopt':
         return adopt(args)
     meta, config, item = current()
-    if args.command == 'list':
+    if args.command == 'enable-api':
+        if config.get('api', {}).get('tag') == API_TAG:
+            api_users(meta, config)
+            print('API уже включён. VPN не перезапускался.')
+            return
+        candidate = configure_api(config, meta.get('tag'), args.port)
+        try:
+            with socket.socket() as sock:
+                sock.bind(('127.0.0.1', args.port))
+        except OSError as exc:
+            raise Error('Порт API занят. Выбери другой --port.') from exc
+        apply_config(meta, candidate, postcheck=lambda: api_users(meta, candidate))
+        print('API включён. Теперь add/remove работают без перезапуска VPN.')
+    elif args.command == 'list':
         for client in item['settings']['clients']:
             print(client.get('email') or '(без имени: добавь email вручную)')
     elif args.command == 'status':
@@ -456,12 +605,12 @@ def dispatch(args):
     elif args.command in ('add', 'link'):
         _, public = key_pair(meta['binary'], item['streamSettings']['realitySettings']['privateKey'])
         if args.command == 'add':
-            if any(c.get('email') == args.name for c in item['settings']['clients']):
+            if any(c.get('email', '').lower() == args.name.lower() for c in item['settings']['clients']):
                 raise Error('Имя уже существует. Используй link, чтобы получить прежнюю ссылку.')
             client = {'id': str(uuid.uuid4()), 'email': args.name, 'flow': FLOW}
             item['settings']['clients'].append(client)
             link = client_link(item, client, meta['host'], public)
-            apply_config(meta, config)
+            apply_user(meta, config, 'add', client)
         else:
             client = unique_client(item, args.name)
             link = client_link(item, client, meta['host'], public)
@@ -475,8 +624,8 @@ def dispatch(args):
                 print('Отменено.')
                 return
         item['settings']['clients'].remove(client)
-        apply_config(meta, config)
-        print(f'Доступ {args.name} отозван.')
+        apply_user(meta, config, 'remove', client)
+        print(f'Новые подключения {args.name} запрещены. Уже открытые соединения могут работать до закрытия.')
 
 
 def main():
